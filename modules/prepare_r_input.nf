@@ -4,7 +4,7 @@ process PREPARE_R_INPUT {
     tag "${meta.id} (target: ${meta.target_cohort})"
     publishDir "${params.outdir}/${meta.cohort}/r_input/${meta.target_cohort}", mode: 'copy'
     
-    conda "bioconda::perl=5.26.2"
+    conda "conda-forge::perl=5.26.2"
 
     input:
     tuple val(meta), path(imputed_vcf)
