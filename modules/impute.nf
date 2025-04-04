@@ -25,13 +25,18 @@ process IMPUTE {
 
     # Run minimac4 imputation
     ${params.minimac4} \
-      ${ref_panel} \
-      ${phased_vcf} \
-      --output ${output_prefix}.vcf.gz \
-      -f GT \
-      --all-typed-sites \
+      --refHaps ${ref_panel} \
+      --haps ${phased_vcf} \
+      --prefix ${output_prefix} \
+      --format GT \
+      --allTypedSites \
       --threads ${task.cpus}
+    
+    # Make sure we have the exact filename required in the output
+    if [ -f "${output_prefix}.dose.vcf.gz" ]; then
+        mv "${output_prefix}.dose.vcf.gz" "${output_prefix}.vcf.gz"
+    fi
     
     echo "Imputation completed for ${meta.id} with reference panel from ${meta.target_cohort}"
     """
-} 
+}

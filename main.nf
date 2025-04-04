@@ -1,6 +1,9 @@
 #!/usr/bin/env nextflow
 nextflow.enable.dsl=2
 
+// Define default parameter values
+params.help = false
+
 // Include modules
 include { ALIGNMENT } from './modules/alignment'
 include { VCF_TO_BCF } from './modules/vcf_to_bcf'
@@ -192,40 +195,52 @@ workflow {
     // --- Imputation Step (Conditional) ---
     if (params.imputer == 'minimac4') {
         // 1. Create Minimac4 reference panels (.m3vcf)
-        CONVERT_REFP(ch_phased_vcf_for_imputation)
-        ch_ref_panels_m3vcf = CONVERT_REFP.out.reference
-             // Key by [chr, cohort_producing_panel] for joining
-            .map { meta, msav -> ["${meta.chr}_${meta.cohort}", meta, msav] }
-            .view { "Minimac4 Ref Panel: Key ${it[0]}" }
+        CONVERT_REFP(ch_phased_vcf_for_imputation
+            .map { meta, vcf, index ->
+                if (!meta || !vcf) {
+                    error "Missing meta or VCF file for reference panel conversion: meta=${meta}, vcf=${vcf}"
+                }
+                return [meta, vcf, index]
+            }
+        )
+        
+        // Store reference panels in a channel format we can join with
+        ch_ref_panels = CONVERT_REFP.out.reference
+            .map { meta, msav -> 
+                def key = "${meta.chr}_${meta.cohort}"
+                log.info "Created reference panel: key=${key}, meta=${meta.id}"
+                return [key, meta, msav]
+            }
+            .view { key, meta, panel -> "Minimac4 Ref Panel: Key ${key}, Meta ${meta.id}, File ${panel}" }
+            
+        // Modify the approach to avoid using cross operation
+        // First, make the imputation pairs have source cohort as key
+        ch_impute_source_keys = ch_imputation_pairs
+            .map { source, target -> [source, [source, target]] }
+        
+        // Now join with phased VCFs (which are already keyed by cohort)
+        ch_impute_source_joined = ch_impute_source_keys
+            .join(ch_phased_vcf_by_cohort)
+            .map { source, pair_info, meta_s, vcf_s, idx_s ->
+                def target = pair_info[1]
+                def meta_impute = meta_s + [target_cohort: target]
+                def ref_key = "${meta_s.chr}_${target}" // Key to find reference panel
+                
+                log.info "Created imputation job: Source=${source}, Target=${target}, Chr=${meta_s.chr}, RefKey=${ref_key}"
+                
+                // Return [ref_key, meta with target info, vcf, index]
+                return [ref_key, meta_impute, vcf_s, idx_s]
+            }
+            
+        // Simplify the channel approach - remove the tap and count operations
+        ch_impute_input_minimac4 = ch_impute_source_joined
+            .join(ch_ref_panels, by: 0) // join on ref_key
+            .map { ref_key, meta_impute, vcf_s, idx_s, meta_r, ref_panel ->
+                log.info "Creating imputation job: ${meta_impute.id} with ref panel from ${meta_r.id}"
+                return [meta_impute, vcf_s, idx_s, ref_panel]
+            }
 
-        // 2. Prepare input for IMPUTE_MINIMAC4
-        //    Join [Source, Target] pairs with phased VCF of Source
-        //    Then join with Ref Panel of Target
-        ch_impute_input_minimac4 = ch_imputation_pairs
-            // Explicitly track the join process
-            .map { source, target -> 
-                log.info "Creating imputation job: Source=${source}, Target=${target}"
-                return [source, source, target] 
-            } 
-            .join(ch_phased_vcf_by_cohort, by: 0)
-            .map { cohort, _source, target, meta_s, vcf_s, index_s ->
-                 def meta_impute = meta_s + [target_cohort: target] // Add target info
-                 def ref_key = "${meta_s.chr}_${target}"          // Key to join with ref panel
-                 log.info "Found source data for ${cohort} chr${meta_s.chr}, looking for ref panel key: ${ref_key}"
-                 return [ ref_key, meta_impute, vcf_s, index_s ]
-            }
-            .join(ch_ref_panels_m3vcf, by: 0, remainder: true) // Add remainder:true to see unmatched keys
-            .view { k, m, v, i, r -> r == null ? 
-                "WARNING: No ref panel found for key: ${k}" : 
-                "Found matching ref panel for ${k}" 
-            }
-            .filter { k, m, v, i, r -> r != null } // Keep only the matched entries
-            .map { _ref_key, meta_i, vcf_s, index_s, _meta_r, ref_panel ->
-                 // Final input: [meta_for_imputation, source_vcf, source_index, ref_panel]
-                 return [ meta_i, vcf_s, index_s, ref_panel ]
-            }
-
-        // 3. Run Minimac4 Imputation
+        // 3. Run Minimac4 Imputation with the matched inputs
         IMPUTE_MINIMAC4(ch_impute_input_minimac4)
         ch_final_imputed_vcf = IMPUTE_MINIMAC4.out.imputed_vcf
 
@@ -307,12 +322,20 @@ workflow {
             def key_filterout = meta.chr
             return [ key_keep, key_filterout, meta, vcf ]
         }
-        .view { kk, kf, m, _v -> "Imputed VCF Keyed: KeepKey ${kk}, FilterKey ${kf}, ID ${m.id}" }
+        .view { tuple -> 
+            // Unpack the tuple explicitly
+            def (kk, kf, m, v) = tuple
+            return "Imputed VCF Keyed: KeepKey ${kk}, FilterKey ${kf}, ID ${m.id}"
+        }
 
     // Join imputed VCFs with keep lists and then with filterout lists
     ch_filter_input = ch_imputed_vcfs_keyed
         .join(ch_keep_lists, by: 0) // Join by key_keep
-        .view { kk, kf, m, v, kl -> "Joined Keep: KeepKey ${kk}, FilterKey ${kf}, ID ${m.id}, KeepFile ${kl}" }
+        .view { tuple ->
+            // Unpack the tuple explicitly
+            def (kk, kf, m, v, kl) = tuple
+            return "Joined Keep: KeepKey ${kk}, FilterKey ${kf}, ID ${m.id}, KeepFile ${kl}"
+        }
         .map { _key_keep, key_filterout, meta, vcf, keep_list ->
             // Re-key for joining with filterout list
             return [ key_filterout, meta, vcf, keep_list ]
@@ -347,14 +370,15 @@ workflow {
 
     workflow.onComplete {
         log.info ( "Pipeline Complete" )
-        // Add summary logic here if needed
-        // e.g., summarize merged files, QC metrics
     }
 
     workflow.onError {
         log.error "Pipeline Failed!"
-        log.error "Error message: ${workflow.errorMessage}"
-        log.error "Exit status: ${workflow.exitStatus}"
-        // Add error handling logic, e.g., cleanup, notification
+        if (workflow.errorMessage) {
+            log.error "Error message: ${workflow.errorMessage}"
+        }
+        if (workflow.exitStatus) {
+            log.error "Exit status: ${workflow.exitStatus}"
+        }
     }
 }
