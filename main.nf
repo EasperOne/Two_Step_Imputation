@@ -76,14 +76,12 @@ def printHelp() {
 workflow {
     printHeader()
     
-    // Show help message if --help is specified
     if (params.help) {
         printHelp()
         exit 0
     }
 
     // --- Validate Parameters ---
-    // Ensure required files/params exist
     if (!params.fasta || !file(params.fasta).exists()) {
         exit 1, "Reference FASTA file not found: ${params.fasta ?: 'parameter not set'}"
     }

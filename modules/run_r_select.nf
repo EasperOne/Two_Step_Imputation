@@ -4,7 +4,7 @@ process RUN_R_SELECT {
     tag "${meta.id}"
     publishDir "${params.outdir}/${meta.cohort}/r_output", mode: 'copy'
     
-    conda "r-base=4.4.1 conda-forge::perl=5.26.2 conda-forge::r-tidyverse conda-forge::r-data.table"
+    conda "r-base=4.4.1 conda-forge::r-tidyverse conda-forge::r-data.table"
 
     input:
     tuple val(meta), path(info_files)

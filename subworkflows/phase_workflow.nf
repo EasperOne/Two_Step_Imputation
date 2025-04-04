@@ -1,5 +1,5 @@
 #!/usr/bin/env nextflow
-
+nextflow.enable.dsl=2
 // Include modules
 include { PHASE as PHASE_EAGLE } from '../modules/phase'
 include { PHASE_SHAPEIT5 } from '../modules/phase_shapeit5'

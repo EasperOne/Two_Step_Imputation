@@ -1,5 +1,5 @@
 #!/usr/bin/env nextflow
-
+nextflow.enable.dsl=2
 // Include modules
 include { PREPARE_R_INPUT } from '../modules/prepare_r_input'
 include { RUN_R_SELECT } from '../modules/run_r_select'
@@ -8,9 +8,12 @@ include { MERGE_VCF } from '../modules/merge_vcf'
 
 workflow POST_IMPUTATION {
     take:
-    ch_final_imputed_vcf // Channel of [meta, vcf, index] from imputation
+    ch_imputed_vcf // Channel of [meta, vcf] from imputation
 
     main:
+    // First, ensure each input has a VCF index by creating one if needed
+    ch_final_imputed_vcf = ch_imputed_vcf
+        
     // --- Downstream Analysis --- (Starts from ch_final_imputed_vcf)
     PREPARE_R_INPUT(ch_final_imputed_vcf)
     ch_r_input = PREPARE_R_INPUT.out.info_files
@@ -23,84 +26,75 @@ workflow POST_IMPUTATION {
         .view { m, files -> "R Input Ready: ${m.id} with ${files.size()} info files" }
 
     RUN_R_SELECT(ch_r_input)
+    
+    // Create empty placeholder file if it doesn't exist
+    file("${workflow.projectDir}/EMPTY_FILE").text = ""
 
-    // --- Filter Setup ---
-    // Process the manifest file from RUN_R_SELECT
+    // --- Extract keep and filterout lists from R output ---
     ch_parsed_manifest = RUN_R_SELECT.out.filter_manifest
         .flatMap { meta_r, manifest_path ->
-            manifest_path.readLines().drop(1) // Read lines, skip header
-                .collect { line ->
-                    def (chr, type, ref_cohort, file_path) = line.split('\t')
-                    // Create keys for joining
-                    def key_keep = "${chr}_${ref_cohort}" // e.g., "10_Cohort_test_2"
-                    def key_filterout = chr              // e.g., "10"
-                    // Return structured data including original meta from R run
-                    return [ meta_r: meta_r, chr: chr, type: type, ref_cohort: ref_cohort, file: file(file_path), key_keep: key_keep, key_filterout: key_filterout ]
+            def results = []
+            manifest_path.readLines().drop(1).each { line ->
+                def fields = line.split('\t')
+                if (fields.size() >= 4) {
+                    def (chr, type, ref_cohort, file_path) = fields
+                    def key = "${chr}_${ref_cohort ?: 'NONE'}"
+                    results << [key: key, chr: chr, type: type, ref_cohort: ref_cohort, file: file(file_path)]
                 }
+            }
+            return results
         }
-        .view { "Parsed Manifest: Chr ${it.chr}, Type ${it.type}, Ref ${it.ref_cohort ?: '-'}, Path ${it.file}" }
+        .view { "Manifest Entry: $it" }
 
-    // Separate keep and filterout lists
-    ch_keep_lists = ch_parsed_manifest
-        .filter { it.type == 'keep' }
-        .map { [ it.key_keep, it.file ] } // Key: "${chr}_${ref_cohort}"
-        .unique { it[0] } // Ensure unique key per keep list
-        .view { "Keep List Channel: Key ${it[0]}, File ${it[1]}" }
+    // Group the manifest entries by key and build filter map
+    ch_filter_map = ch_parsed_manifest
+        .groupTuple(by: 'key')
+        .map { entry ->
+            def key = entry.key[0]
+            def keep_file = entry.type.contains('keep') ? 
+                entry.file[entry.type.indexOf('keep')] : 
+                file("${workflow.projectDir}/EMPTY_FILE")
+            def filterout_file = entry.type.contains('filterout') ? 
+                entry.file[entry.type.indexOf('filterout')] : 
+                file("${workflow.projectDir}/EMPTY_FILE")
+            [key, filterout_file, keep_file]
+        }
+        .view { "Filter Files Map: $it" }
 
-    ch_filterout_lists = ch_parsed_manifest
-        .filter { it.type == 'filterout' }
-        .map { [ it.key_filterout, it.file ] } // Key: "${chr}"
-        .unique { it[0] } // Ensure unique key per filterout list (one per chromosome)
-        .view { "Filterout List Channel: Key ${it[0]}, File ${it[1]}" }
+    // Prepare imputed VCFs for filtering with proper keys
+    ch_imputed_for_filter = ch_imputed_vcf
+        .map { meta, vcf, index -> 
+            def key = "${meta.chr}_${meta.target_cohort ?: 'NONE'}"
+            [key, meta, vcf, index]
+        }
+        .view { "Imputed for filter: $it" }
 
-    // Prepare imputed VCFs for joining
-    ch_imputed_vcfs_keyed = ch_final_imputed_vcf
-        .filter { meta, _vcf, _index -> meta?.chr != null && meta?.target_cohort != null }
-        .map { meta, vcf, _index -> // Handle VCF + Index tuple
-            def key_keep = "${meta.chr}_${meta.target_cohort}"
-            def key_filterout = meta.chr
-            return [ key_keep, key_filterout, meta, vcf ]
+    // Join imputed VCFs with filter files
+    ch_filter_input = ch_imputed_for_filter
+        .join(ch_filter_map, by: 0, remainder: true)
+        .map { key, meta, vcf, index, filterout, keep ->
+            // Use default empty files if no filter files found
+            def filterout_final = filterout ?: file("${workflow.projectDir}/EMPTY_FILE")
+            def keep_final = keep ?: file("${workflow.projectDir}/EMPTY_FILE")
+            [meta, vcf, index, filterout_final, keep_final]
         }
-        .view { tuple -> 
-            // Unpack the tuple explicitly
-            def (kk, kf, m, _v) = tuple
-            return "Imputed VCF Keyed: KeepKey ${kk}, FilterKey ${kf}, ID ${m.id}"
-        }
+        .view { "Filter Input: $it" }
 
-    // Join imputed VCFs with keep lists and then with filterout lists
-    ch_filter_input = ch_imputed_vcfs_keyed
-        .join(ch_keep_lists, by: 0) // Join by key_keep
-        .view { tuple ->
-            // Unpack the tuple explicitly
-            def (kk, kf, m, _v, kl) = tuple
-            return "Joined Keep: KeepKey ${kk}, FilterKey ${kf}, ID ${m.id}, KeepFile ${kl}"
-        }
-        .map { _key_keep, key_filterout, meta, vcf, keep_list ->
-            // Re-key for joining with filterout list
-            return [ key_filterout, meta, vcf, keep_list ]
-        }
-        .join(ch_filterout_lists, by: 0) // Join by key_filterout
-        .view { kf, m, _v, kl, fl -> "Joined Filterout: FilterKey ${kf}, ID ${m.id}, KeepFile ${kl}, FilterFile ${fl}" }
-        .map { _key_filterout, meta, vcf, keep_list, filterout_list ->
-            // Final mapping to FILTER_VCF input format
-            return [ meta, vcf, filterout_list, keep_list ]
-        }
-
+    // Run the filter VCF process
     FILTER_VCF(ch_filter_input)
     
     // --- Merge Setup ---
     // Group filtered VCFs by cohort and chromosome for merging
     ch_merge_input = FILTER_VCF.out.filtered_vcf
-        .filter { meta, _vcf, _index -> meta != null && meta.cohort != null && meta.chr != null }
         .map { meta, vcf, index -> 
             return [ meta.cohort, meta.chr, meta, vcf, index ]
         }
         .groupTuple(by: [0, 1]) // Group by [cohort, chr]
-        .map { _cohort, _chr, _metas, vcfs, indices ->
+        .map { cohort, chr, metas, vcfs, indices ->
             def meta = [
-                id: "${_cohort}_chr${_chr}_merged",
-                cohort: _cohort,
-                chr: _chr
+                id: "${cohort}_chr${chr}_merged",
+                cohort: cohort,
+                chr: chr
             ]
             return [ meta, vcfs, indices ]
         }
